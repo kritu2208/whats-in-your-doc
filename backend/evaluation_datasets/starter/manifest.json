@@ -1,0 +1,105 @@
+{
+  "dataset_id": "hybrid-rag-synthetic-starter",
+  "dataset_version": "0.1.0",
+  "corpus_label": "synthetic_starter",
+  "synthetic_notice": "All documents and facts in this corpus are fictional test material created solely to exercise evaluation data structures. They are not real-world evidence and must be manually reviewed before use.",
+  "documents": [
+    {
+      "document_ref": "SYN-OPS-001",
+      "filename": "operations-handbook.md",
+      "title": "Synthetic Operations Handbook",
+      "content_file": "corpus/operations-handbook.md",
+      "source_type": "markdown",
+      "chunks": [
+        {"chunk_ref": "c01", "anchor": "service-hours", "ingestion_file": "corpus/ingestion/SYN-OPS-001-c01.md"},
+        {"chunk_ref": "c02", "anchor": "support-routing", "ingestion_file": "corpus/ingestion/SYN-OPS-001-c02.md"},
+        {"chunk_ref": "c03", "anchor": "approvals", "ingestion_file": "corpus/ingestion/SYN-OPS-001-c03.md"}
+      ]
+    },
+    {
+      "document_ref": "SYN-SEC-002",
+      "filename": "access-standard.md",
+      "title": "Synthetic Access Standard",
+      "content_file": "corpus/access-standard.md",
+      "source_type": "markdown",
+      "chunks": [
+        {"chunk_ref": "c01", "anchor": "identity", "ingestion_file": "corpus/ingestion/SYN-SEC-002-c01.md"},
+        {"chunk_ref": "c02", "anchor": "access-review", "ingestion_file": "corpus/ingestion/SYN-SEC-002-c02.md"},
+        {"chunk_ref": "c03", "anchor": "credential-handling", "ingestion_file": "corpus/ingestion/SYN-SEC-002-c03.md"},
+        {"chunk_ref": "c04", "anchor": "access-removal", "ingestion_file": "corpus/ingestion/SYN-SEC-002-c04.md"}
+      ]
+    },
+    {
+      "document_ref": "SYN-SUP-003",
+      "filename": "support-playbook.md",
+      "title": "Synthetic Support Playbook",
+      "content_file": "corpus/support-playbook.md",
+      "source_type": "markdown",
+      "chunks": [
+        {"chunk_ref": "c01", "anchor": "ticket-acknowledgement", "ingestion_file": "corpus/ingestion/SYN-SUP-003-c01.md"},
+        {"chunk_ref": "c02", "anchor": "priority-targets", "ingestion_file": "corpus/ingestion/SYN-SUP-003-c02.md"},
+        {"chunk_ref": "c03", "anchor": "closure", "ingestion_file": "corpus/ingestion/SYN-SUP-003-c03.md"}
+      ]
+    },
+    {
+      "document_ref": "SYN-REL-004",
+      "filename": "release-calendar.md",
+      "title": "Synthetic Release Calendar",
+      "content_file": "corpus/release-calendar.md",
+      "source_type": "markdown",
+      "chunks": [
+        {"chunk_ref": "c01", "anchor": "cadence", "ingestion_file": "corpus/ingestion/SYN-REL-004-c01.md"},
+        {"chunk_ref": "c02", "anchor": "freeze", "ingestion_file": "corpus/ingestion/SYN-REL-004-c02.md"},
+        {"chunk_ref": "c03", "anchor": "approval", "ingestion_file": "corpus/ingestion/SYN-REL-004-c03.md"}
+      ]
+    },
+    {
+      "document_ref": "SYN-DATA-005",
+      "filename": "data-handling.md",
+      "title": "Synthetic Data Handling Note",
+      "content_file": "corpus/data-handling.md",
+      "source_type": "markdown",
+      "chunks": [
+        {"chunk_ref": "c01", "anchor": "retention", "ingestion_file": "corpus/ingestion/SYN-DATA-005-c01.md"},
+        {"chunk_ref": "c02", "anchor": "deletion", "ingestion_file": "corpus/ingestion/SYN-DATA-005-c02.md"},
+        {"chunk_ref": "c03", "anchor": "exports", "ingestion_file": "corpus/ingestion/SYN-DATA-005-c03.md"}
+      ]
+    },
+    {
+      "document_ref": "SYN-INC-006",
+      "filename": "incident-guide.md",
+      "title": "Synthetic Incident Guide",
+      "content_file": "corpus/incident-guide.md",
+      "source_type": "markdown",
+      "chunks": [
+        {"chunk_ref": "c01", "anchor": "severity", "ingestion_file": "corpus/ingestion/SYN-INC-006-c01.md"},
+        {"chunk_ref": "c02", "anchor": "communication", "ingestion_file": "corpus/ingestion/SYN-INC-006-c02.md"},
+        {"chunk_ref": "c03", "anchor": "recovery", "ingestion_file": "corpus/ingestion/SYN-INC-006-c03.md"}
+      ]
+    },
+    {
+      "document_ref": "SYN-QUAL-007",
+      "filename": "quality-checklist.md",
+      "title": "Synthetic Quality Checklist",
+      "content_file": "corpus/quality-checklist.md",
+      "source_type": "markdown",
+      "chunks": [
+        {"chunk_ref": "c01", "anchor": "automated-gates", "ingestion_file": "corpus/ingestion/SYN-QUAL-007-c01.md"},
+        {"chunk_ref": "c02", "anchor": "manual-review", "ingestion_file": "corpus/ingestion/SYN-QUAL-007-c02.md"},
+        {"chunk_ref": "c03", "anchor": "defect-policy", "ingestion_file": "corpus/ingestion/SYN-QUAL-007-c03.md"}
+      ]
+    },
+    {
+      "document_ref": "SYN-COST-008",
+      "filename": "service-budget.md",
+      "title": "Synthetic Service Budget",
+      "content_file": "corpus/service-budget.md",
+      "source_type": "markdown",
+      "chunks": [
+        {"chunk_ref": "c01", "anchor": "monthly-cap", "ingestion_file": "corpus/ingestion/SYN-COST-008-c01.md"},
+        {"chunk_ref": "c02", "anchor": "alerts", "ingestion_file": "corpus/ingestion/SYN-COST-008-c02.md"},
+        {"chunk_ref": "c03", "anchor": "exceptions", "ingestion_file": "corpus/ingestion/SYN-COST-008-c03.md"}
+      ]
+    }
+  ]
+}
