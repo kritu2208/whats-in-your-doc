@@ -89,8 +89,8 @@ Built-in floral side-drawer for study notes with one-click **🌸 Save to notes*
 
 ### 1. Clone & Configure
 ```bash
-git clone https://github.com/kritu2208/hybrid-rag.git
-cd hybrid-rag
+git clone https://github.com/kritu2208/whats-in-your-doc.git
+cd whats-in-your-doc
 cp .env.example .env
 ```
 Add your Groq API key in `.env`:
