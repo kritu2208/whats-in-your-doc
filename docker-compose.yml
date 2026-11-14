@@ -23,6 +23,9 @@ services:
       - .env
     environment:
       DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      HF_HOME: /root/.cache/huggingface
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -42,6 +45,8 @@ services:
       context: ./frontend
       args:
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+    volumes:
+      - ./frontend/dist:/usr/share/nginx/html:ro
     ports:
       - "${FRONTEND_PORT:-8080}:80"
     depends_on:
@@ -51,3 +56,4 @@ services:
 
 volumes:
   postgres_data:
+  huggingface_cache:

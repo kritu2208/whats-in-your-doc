@@ -13,7 +13,7 @@ from pypdf import PdfReader
 
 logger = logging.getLogger(__name__)
 
-MAX_PDF_IMAGES = 30
+MAX_PDF_IMAGES = 100
 MAX_PDF_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_PDF_IMAGES_BYTES = 20 * 1024 * 1024
 IMAGE_MEDIA_TYPES = {

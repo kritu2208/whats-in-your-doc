@@ -484,6 +484,406 @@ def test_groq_service_bounds_vision_image_payload() -> None:
     assert len(encoded_image) <= 512 * 1024
 
 
+def test_groq_service_reduces_images_and_falls_back_to_text_on_413() -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    image_bytes_list: list[bytes] = []
+    for index in range(3):
+        buffer = BytesIO()
+        Image.new("RGB", (8, 8), color=(index * 40, 80, 120)).save(buffer, format="PNG")
+        image_bytes_list.append(buffer.getvalue())
+
+    class PayloadTooLargeError(RuntimeError):
+        def __init__(self, status_code: int) -> None:
+            super().__init__("payload limit exceeded")
+            self.status_code = status_code
+
+    calls: list[dict[str, Any]] = []
+
+    class SequentialCompletions:
+        def create(self, **kwargs: Any) -> Any:
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise PayloadTooLargeError(413)
+            if len(calls) == 2:
+                raise PayloadTooLargeError(429)
+            return fake_groq_response(
+                '{"answer":"Siamese cats have a triangular head.","cited_chunk_ids":["chunk-1"],'
+                '"cited_image_ids":[],"unanswerable":false}'
+            )
+
+    sequential_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SequentialCompletions())
+    )
+    service = GroqLLMService(
+        api_key="test-key",
+        model="text-model",
+        vision_model="vision-model",
+        timeout_seconds=12,
+        client_factory=lambda **_: sequential_client,
+    )
+
+    long_context = "chunk-1: Siamese cats have a triangular head. " + ("x" * 9000)
+    images = [
+        VisionImage(
+            image_id=f"image-{idx + 1}",
+            label=f"cats.pdf, page {idx + 1}",
+            media_type="image/png",
+            data=raw,
+        )
+        for idx, raw in enumerate(image_bytes_list)
+    ]
+
+    answer = service.generate_answer(
+        question="send about siamese",
+        context=long_context,
+        history=[],
+        images=images,
+    )
+
+    assert answer.answer == "Siamese cats have a triangular head."
+    assert answer.cited_chunk_ids == ["chunk-1"]
+    assert len(calls) == 3
+    assert calls[0]["model"] == "vision-model"
+    assert calls[0]["max_tokens"] == 800
+    assert sum(1 for item in calls[0]["messages"][-1]["content"] if item["type"] == "image_url") == 2
+    assert calls[1]["model"] == "vision-model"
+    assert sum(1 for item in calls[1]["messages"][-1]["content"] if item["type"] == "image_url") == 1
+    assert calls[2]["model"] == "text-model"
+    assert calls[2]["max_tokens"] == 1200
+    assert long_context in calls[2]["messages"][-1]["content"]
+
+
+def test_groq_service_stream_falls_back_to_text_on_vision_413() -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (4, 4), color=(10, 20, 30)).save(buffer, format="PNG")
+    raw_image = buffer.getvalue()
+
+    class PayloadTooLargeError(RuntimeError):
+        status_code = 413
+
+    calls: list[dict[str, Any]] = []
+
+    class StreamingFallbackCompletions:
+        def create(self, **kwargs: Any) -> Any:
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise PayloadTooLargeError("too large")
+            payload = (
+                '{"answer":"Siamese cats are vocal.","cited_chunk_ids":["chunk-1"],'
+                '"cited_image_ids":[],"unanswerable":false}'
+            )
+            return iter(
+                [
+                    SimpleNamespace(
+                        choices=[SimpleNamespace(delta=SimpleNamespace(content=payload))]
+                    )
+                ]
+            )
+
+    streaming_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=StreamingFallbackCompletions())
+    )
+    service = GroqLLMService(
+        api_key="test-key",
+        model="text-model",
+        vision_model="vision-model",
+        timeout_seconds=12,
+        client_factory=lambda **_: streaming_client,
+    )
+
+    stream = service.stream_answer(
+        question="send about siamese",
+        context="chunk-1: Siamese cats are vocal.",
+        history=[],
+        images=[
+            VisionImage(
+                image_id="image-1",
+                label="cats.pdf, page 1",
+                media_type="image/png",
+                data=raw_image,
+            )
+        ],
+    )
+    deltas = []
+    try:
+        while True:
+            deltas.append(next(stream))
+    except StopIteration as stopped:
+        final = stopped.value
+
+    assert "".join(deltas) == "Siamese cats are vocal."
+    assert final.cited_chunk_ids == ["chunk-1"]
+    assert [call["model"] for call in calls] == ["vision-model", "text-model"]
+    assert all(call.get("stream") is True for call in calls)
+
+
+def test_groq_service_vision_bounds_long_history() -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (4, 4), color=(15, 25, 35)).save(buffer, format="PNG")
+    raw_image = buffer.getvalue()
+
+    class PayloadTooLargeError(RuntimeError):
+        status_code = 413
+
+    calls: list[dict[str, Any]] = []
+
+    class HistoryCheckingCompletions:
+        def create(self, **kwargs: Any) -> Any:
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise PayloadTooLargeError("too large")
+            return fake_groq_response(
+                '{"answer":"Persian cat shown.","cited_chunk_ids":["chunk-1"],'
+                '"cited_image_ids":[],"unanswerable":false}'
+            )
+
+    service = GroqLLMService(
+        api_key="test-key",
+        model="text-model",
+        vision_model="vision-model",
+        timeout_seconds=12,
+        client_factory=lambda **_: SimpleNamespace(
+            chat=SimpleNamespace(completions=HistoryCheckingCompletions())
+        ),
+    )
+
+    long_history = [
+        {"role": "user", "content": f"turn {i} " + ("a" * 600)}
+        if i % 2 == 0
+        else {"role": "assistant", "content": f"reply {i} " + ("b" * 600)}
+        for i in range(6)
+    ]
+
+    answer = service.generate_answer(
+        question="show me image of persian cat",
+        context="chunk-1: Persian cat photo on page 1.",
+        history=long_history,
+        images=[
+            VisionImage(
+                image_id="image-1",
+                label="cats.pdf, page 1",
+                media_type="image/png",
+                data=raw_image,
+            )
+        ],
+    )
+
+    assert answer.answer == "Persian cat shown."
+    vision_history_msgs = calls[0]["messages"][1:-1]
+    text_history_msgs = calls[1]["messages"][1:-1]
+    assert sum(len(msg["content"]) for msg in vision_history_msgs) <= 1200
+    assert len(text_history_msgs) == len(long_history)
+
+
+def test_groq_service_stream_falls_back_on_vision_malformed_stream() -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (4, 4), color=(10, 20, 30)).save(buffer, format="PNG")
+    raw_image = buffer.getvalue()
+
+    calls: list[dict[str, Any]] = []
+
+    class MalformedThenValidStreamCompletions:
+        def create(self, **kwargs: Any) -> Any:
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return iter(
+                    [
+                        SimpleNamespace(
+                            choices=[
+                                SimpleNamespace(
+                                    delta=SimpleNamespace(content="not valid json")
+                                )
+                            ]
+                        )
+                    ]
+                )
+            payload = (
+                '{"answer":"Persian cats have long coats.","cited_chunk_ids":["chunk-1"],'
+                '"cited_image_ids":[],"unanswerable":false}'
+            )
+            return iter(
+                [
+                    SimpleNamespace(
+                        choices=[SimpleNamespace(delta=SimpleNamespace(content=payload))]
+                    )
+                ]
+            )
+
+    service = GroqLLMService(
+        api_key="test-key",
+        model="text-model",
+        vision_model="vision-model",
+        timeout_seconds=12,
+        client_factory=lambda **_: SimpleNamespace(
+            chat=SimpleNamespace(completions=MalformedThenValidStreamCompletions())
+        ),
+    )
+
+    stream = service.stream_answer(
+        question="show me image of persian cat",
+        context="chunk-1: Persian cats have long coats.",
+        history=[],
+        images=[
+            VisionImage(
+                image_id="image-1",
+                label="cats.pdf, page 1",
+                media_type="image/png",
+                data=raw_image,
+            )
+        ],
+    )
+    deltas = []
+    try:
+        while True:
+            deltas.append(next(stream))
+    except StopIteration as stopped:
+        final = stopped.value
+
+    assert "".join(deltas) == "Persian cats have long coats."
+    assert final.cited_chunk_ids == ["chunk-1"]
+    assert [call["model"] for call in calls] == ["vision-model", "text-model"]
+
+
+def test_workflow_handles_greetings_conversationally_without_abstention() -> None:
+    class ConversationalFakeLLM(FakeLLM):
+        def generate_conversational_reply(
+            self, *, question: str, history: list[dict[str, str]]
+        ) -> str:
+            self.calls.append({"greeting_question": question, "history": history})
+            return "Hey! How can I help you with your documents today?"
+
+        def stream_conversational_reply(
+            self, *, question: str, history: list[dict[str, str]]
+        ) -> Generator[str, None, str]:
+            reply = self.generate_conversational_reply(
+                question=question, history=history
+            )
+            yield "Hey! "
+            yield "How can I help you with your documents today?"
+            return reply
+
+    retrieval = FakeRetrievalEngine([retrieval_result()])
+    reranker = FakeReranker()
+    llm = ConversationalFakeLLM()
+    workflow = RAGWorkflow(retrieval, reranker, llm)
+
+    result = workflow.invoke(
+        question="hey",
+        conversation_id=None,
+        document_ids=None,
+        retrieval_mode=RetrievalMode.HYBRID_RERANK,
+        top_k=5,
+        candidate_k=20,
+        history=[],
+    )
+    assert result["answer"] == "Hey! How can I help you with your documents today?"
+    assert result["citations"] == []
+    assert result["unanswerable"] is False
+    assert retrieval.calls == []
+    assert reranker.calls == []
+
+    stream = workflow.stream(
+        question="good morning!",
+        conversation_id=None,
+        document_ids=None,
+        retrieval_mode=RetrievalMode.HYBRID_RERANK,
+        top_k=5,
+        candidate_k=20,
+        history=[],
+    )
+    deltas = []
+    while True:
+        try:
+            deltas.append(next(stream))
+        except StopIteration as stopped:
+            stream_result = stopped.value
+            break
+    assert "".join(deltas) == "Hey! How can I help you with your documents today?"
+    assert stream_result["citations"] == []
+    assert stream_result["unanswerable"] is False
+
+    # Question containing a greeting plus an actual document query still runs RAG retrieval.
+    rag_result = workflow.invoke(
+        question="hey what is in the doc",
+        conversation_id=None,
+        document_ids=None,
+        retrieval_mode=RetrievalMode.HYBRID_RERANK,
+        top_k=5,
+        candidate_k=20,
+        history=[],
+    )
+    assert len(retrieval.calls) == 1
+    assert len(rag_result["citations"]) == 1
+
+
+def test_groq_service_conversational_reply_and_stream() -> None:
+    calls: list[dict[str, Any]] = []
+
+    class ConversationalCompletions:
+        def create(self, **kwargs: Any) -> Any:
+            calls.append(kwargs)
+            if kwargs.get("stream"):
+                return iter(
+                    [
+                        SimpleNamespace(
+                            choices=[
+                                SimpleNamespace(delta=SimpleNamespace(content="Good "))
+                            ]
+                        ),
+                        SimpleNamespace(
+                            choices=[
+                                SimpleNamespace(
+                                    delta=SimpleNamespace(
+                                        content="morning! How can I help with your docs?"
+                                    )
+                                )
+                            ]
+                        ),
+                    ]
+                )
+            return fake_groq_response("Hey! How can I help you with your documents?")
+
+    service = GroqLLMService(
+        api_key="test-key",
+        model="text-model",
+        vision_model="vision-model",
+        timeout_seconds=12,
+        client_factory=lambda **_: SimpleNamespace(
+            chat=SimpleNamespace(completions=ConversationalCompletions())
+        ),
+    )
+
+    reply = service.generate_conversational_reply(question="hey", history=[])
+    assert reply == "Hey! How can I help you with your documents?"
+
+    stream = service.stream_conversational_reply(question="good morning", history=[])
+    chunks: list[str] = []
+    while True:
+        try:
+            chunks.append(next(stream))
+        except StopIteration as stopped:
+            final = stopped.value
+            break
+    assert "".join(chunks) == "Good morning! How can I help with your docs?"
+    assert final == "Good morning! How can I help with your docs?"
+    assert [call["model"] for call in calls] == ["text-model", "text-model"]
+
+
 class FakeRepository:
     def __init__(self) -> None:
         self.persisted: dict[str, Any] | None = None
@@ -902,3 +1302,162 @@ def test_chat_repository_rejects_missing_documents_and_conversations() -> None:
         repository.validate_documents([uuid.UUID(int=404)])
     with pytest.raises(ConversationNotFoundError):
         repository.get_conversation(uuid.UUID(int=404))
+
+
+def test_chat_api_auto_retrieves_and_prioritizes_cited_images_on_image_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document_id = uuid.UUID(int=100)
+    first_image_id = uuid.UUID(int=801)
+    second_image_id = uuid.UUID(int=802)
+
+    repository = FakeRepository()
+    workflow = FakeWorkflow()
+    workflow.cited_image_ids = [str(second_image_id)]
+
+    def retrieve_two_images(*args: Any, **kwargs: Any) -> list[chat_api.RetrievedChatImage]:
+        return [
+            chat_api.RetrievedChatImage(
+                source=chat_api.ChatImage(
+                    document_id=document_id,
+                    document_name="cats.pdf",
+                    image_id=first_image_id,
+                    page_number=1,
+                    filename="page-1-image-1.jpg",
+                    media_type="image/jpeg",
+                    image_url=f"/api/documents/{document_id}/images/{first_image_id}",
+                ),
+                data=b"img-1",
+            ),
+            chat_api.RetrievedChatImage(
+                source=chat_api.ChatImage(
+                    document_id=document_id,
+                    document_name="cats.pdf",
+                    image_id=second_image_id,
+                    page_number=2,
+                    filename="page-2-image-1.jpg",
+                    media_type="image/jpeg",
+                    image_url=f"/api/documents/{document_id}/images/{second_image_id}",
+                ),
+                data=b"img-2",
+            ),
+        ]
+
+    monkeypatch.setattr(chat_api, "get_relevant_images", retrieve_two_images)
+    main.app.dependency_overrides[get_db] = lambda: object()
+    main.app.dependency_overrides[get_chat_repository] = lambda: repository
+    main.app.dependency_overrides[get_rag_workflow] = lambda: workflow
+    try:
+        with TestClient(main.app) as client:
+            response = client.post(
+                "/api/chat/query",
+                json={"question": "show me picture of persian cat"},
+            )
+    finally:
+        main.app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["image_id"] for item in payload["images"]] == [
+        str(second_image_id),
+        str(first_image_id),
+    ]
+    assert [item["cited"] for item in payload["images"]] == [True, False]
+
+
+def test_workflow_contextualizes_followup_queries_for_retrieval_and_reranking() -> None:
+    workflow, retrieval, reranker, llm = workflow_for([retrieval_result()])
+    history = [
+        {"role": "user", "content": "hey"},
+        {"role": "assistant", "content": "Hey! How can I help?"},
+        {"role": "user", "content": "tell me about persian cat"},
+        {"role": "assistant", "content": "Persian cats have a flat face."},
+    ]
+
+    workflow.invoke(
+        question="explain that like a 5 year old",
+        conversation_id=None,
+        document_ids=None,
+        retrieval_mode=RetrievalMode.HYBRID_RERANK,
+        top_k=1,
+        candidate_k=5,
+        history=history,
+    )
+
+    assert retrieval.calls[0]["query"] == "tell me about persian cat explain that like a 5 year old"
+    assert reranker.calls[0]["query"] == "tell me about persian cat explain that like a 5 year old"
+    assert llm.calls[0]["question"] == "explain that like a 5 year old"
+
+    # Fresh self-contained multi-word questions do not get mixed with prior turn topic.
+    workflow.invoke(
+        question="What is the 2026 marketing budget?",
+        conversation_id=None,
+        document_ids=None,
+        retrieval_mode=RetrievalMode.HYBRID_RERANK,
+        top_k=1,
+        candidate_k=5,
+        history=history,
+    )
+    assert retrieval.calls[1]["query"] == "What is the 2026 marketing budget?"
+
+
+def test_chat_conversations_list_detail_and_delete_api() -> None:
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(
+        engine,
+        tables=[Conversation.__table__, Message.__table__],
+    )
+    with Session(engine) as session:
+        repo = ChatRepository(session)
+        first_conv_id = repo.persist_exchange(
+            conversation_id=None,
+            question="Tell me about Persian cats",
+            answer="Persian cats have flat faces.",
+            citations=[
+                {
+                    "document_id": str(uuid.UUID(int=100)),
+                    "document_name": "cats.pdf",
+                    "chunk_id": str(uuid.UUID(int=1)),
+                    "page_number": 1,
+                    "chunk_index": 0,
+                    "excerpt": "Persian cats have a distinct flat face.",
+                }
+            ],
+        )
+        second_conv_id = repo.persist_exchange(
+            conversation_id=None,
+            question="What is the budget?",
+            answer="The budget is 10M.",
+            citations=[],
+        )
+
+        main.app.dependency_overrides[get_chat_repository] = lambda: ChatRepository(session)
+        try:
+            with TestClient(main.app) as client:
+                list_response = client.get("/api/chat/conversations")
+                assert list_response.status_code == 200
+                items = list_response.json()
+                assert len(items) == 2
+                returned_ids = {item["id"] for item in items}
+                assert returned_ids == {str(first_conv_id), str(second_conv_id)}
+                first_item = next(item for item in items if item["id"] == str(first_conv_id))
+                assert first_item["title"] == "Tell me about Persian cats"
+                assert first_item["message_count"] == 2
+
+                detail_response = client.get(f"/api/chat/conversations/{first_conv_id}")
+                assert detail_response.status_code == 200
+                detail = detail_response.json()
+                assert [msg["role"] for msg in detail["messages"]] == ["user", "assistant"]
+                assert detail["messages"][1]["citations"][0]["document_name"] == "cats.pdf"
+
+                delete_response = client.delete(f"/api/chat/conversations/{first_conv_id}")
+                assert delete_response.status_code == 204
+
+                missing_response = client.get(f"/api/chat/conversations/{first_conv_id}")
+                assert missing_response.status_code == 404
+        finally:
+            main.app.dependency_overrides.clear()

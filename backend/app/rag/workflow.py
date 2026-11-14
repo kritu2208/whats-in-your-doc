@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Generator
 from typing import Any, Protocol, TypedDict
@@ -14,6 +15,68 @@ from app.retrieval.reranker import CrossEncoderReranker
 UNANSWERABLE_ANSWER = (
     "The uploaded documents do not provide enough information to answer this question."
 )
+DEFAULT_GREETING_ANSWER = (
+    "Hey! How can I help you with your uploaded documents today?"
+)
+
+_GREETING_PATTERN = re.compile(
+    r"^(?:"
+    r"h+e+y+|h+i+|h+e+l+o+|h+i+y+a+|h+o+l+a+|y+o+|s+u+p+|namaste|"
+    r"good\s+(?:morning|afternoon|evening|night)|gm|"
+    r"what(?:'s|s)?\s+up|"
+    r"how\s+(?:are\s+(?:you|u)|r\s+u|(?:is|'s)\s+it\s+going)|"
+    r"thank\s*(?:you|u)|thanks|thx|ty|"
+    r"bye|goodbye|see\s+(?:you|ya)"
+    r")(?:\s+(?:there|bro|buddy|mate|friend|bot|assistant|ai))?$"
+)
+
+
+_IMAGE_REQUEST_PATTERN = re.compile(
+    r"\b(?:images?|pictures?|photos?|pics?|diagrams?|figures?|illustrations?|"
+    r"charts?|graphs?|screenshots?|visuals?|show\s+me|looks?\s+like)\b"
+)
+_FOLLOWUP_REFERENCE_PATTERN = re.compile(
+    r"\b(?:it|its|this|that|these|those|they|them|their|above|earlier|"
+    r"more|else|simply|simplify|example|summarize|elaborate)\b|"
+    r"(?:like\s+(?:a|an)\s+\d+|explain\s+again|tell\s+me\s+more)"
+)
+
+
+def is_conversational_greeting(text: str) -> bool:
+    """Return True when input is a pure conversational greeting or pleasantry."""
+    normalized = re.sub(r"[^a-z0-9'\s]", " ", text.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return False
+    return bool(_GREETING_PATTERN.fullmatch(normalized))
+
+
+def is_image_request(text: str) -> bool:
+    """Return True when the user explicitly asks to see or find an image/figure."""
+    if is_conversational_greeting(text):
+        return False
+    return bool(_IMAGE_REQUEST_PATTERN.search(text.lower()))
+
+
+def build_retrieval_query(question: str, history: list[dict[str, str]]) -> str:
+    """Expand dependent follow-up questions with the prior user turn for retrieval."""
+    cleaned = question.strip()
+    if not cleaned or not history:
+        return cleaned
+    lowered = cleaned.lower()
+    is_dependent = bool(_FOLLOWUP_REFERENCE_PATTERN.search(lowered)) or len(lowered.split()) <= 3
+    if not is_dependent:
+        return cleaned
+    for item in reversed(history):
+        if item.get("role") != "user":
+            continue
+        prior = (item.get("content") or "").strip()
+        if not prior or is_conversational_greeting(prior):
+            continue
+        if prior.lower() == lowered:
+            continue
+        return f"{prior[:200]} {cleaned}"
+    return cleaned
 
 
 class AnswerGenerator(Protocol):
@@ -38,6 +101,7 @@ class AnswerGenerator(Protocol):
 
 class RAGState(TypedDict, total=False):
     question: str
+    retrieval_query: str
     conversation_id: uuid.UUID | None
     document_ids: list[uuid.UUID] | None
     retrieval_mode: RetrievalMode
@@ -52,6 +116,7 @@ class RAGState(TypedDict, total=False):
     cited_chunk_ids: list[str]
     cited_image_ids: list[str]
     citations: list[dict[str, Any]]
+    conversational: bool
     unanswerable: bool
     retrieval_metadata: dict[str, Any]
 
@@ -145,7 +210,25 @@ class RAGWorkflow:
         for node in (self.retrieve_chunks, self.rerank_chunks, self.build_context):
             state.update(node(state))
 
-        if not state.get("context", "").strip() and not state.get("images"):
+        if state.get("conversational"):
+            stream_reply = getattr(self.llm, "stream_conversational_reply", None)
+            if callable(stream_reply):
+                reply = yield from stream_reply(
+                    question=state["question"],
+                    history=state.get("history", []),
+                )
+            else:
+                reply = DEFAULT_GREETING_ANSWER
+                yield reply
+            state.update(
+                {
+                    "answer": reply,
+                    "cited_chunk_ids": [],
+                    "cited_image_ids": [],
+                    "unanswerable": False,
+                }
+            )
+        elif not state.get("context", "").strip() and not state.get("images"):
             state.update(self.generate_answer(state))
             yield state["answer"]
         else:
@@ -173,25 +256,42 @@ class RAGWorkflow:
         question = state.get("question", "").strip()
         if not question:
             raise ValueError("Question must not be empty.")
+        retrieval_query = build_retrieval_query(
+            question, state.get("history", [])
+        )
         return {
             "question": question,
+            "retrieval_query": retrieval_query,
             "candidates": [],
             "chunks": [],
             "images": state.get("images", []),
             "citations": [],
+            "conversational": is_conversational_greeting(question),
             "retrieval_metadata": {},
         }
 
     def retrieve_chunks(self, state: RAGState) -> RAGState:
         mode = state["retrieval_mode"]
+        if state.get("conversational"):
+            return {
+                "candidates": [],
+                "chunks": [],
+                "retrieval_metadata": {
+                    "mode": mode.value,
+                    "candidate_count": 0,
+                    "result_count": 0,
+                    "conversational": True,
+                },
+            }
         candidate_k = state.get("candidate_k") or get_settings().retrieval_candidate_k
         retrieval_limit = (
             max(candidate_k, state["top_k"])
             if mode is RetrievalMode.HYBRID_RERANK
             else state["top_k"]
         )
+        retrieval_query = state.get("retrieval_query") or state["question"]
         candidates = self.retrieval_engine.retrieve(
-            state["question"],
+            retrieval_query,
             mode=(
                 RetrievalMode.HYBRID
                 if mode is RetrievalMode.HYBRID_RERANK
@@ -212,13 +312,18 @@ class RAGWorkflow:
         }
 
     def rerank_chunks(self, state: RAGState) -> RAGState:
+        if state.get("conversational"):
+            metadata = dict(state.get("retrieval_metadata", {}))
+            metadata["result_count"] = 0
+            return {"chunks": [], "retrieval_metadata": metadata}
         candidates = state.get("candidates", [])
         if (
             state["retrieval_mode"] is RetrievalMode.HYBRID_RERANK
             and candidates
         ):
+            retrieval_query = state.get("retrieval_query") or state["question"]
             chunks = self.reranker.rerank(
-                state["question"],
+                retrieval_query,
                 candidates,
                 top_k=state["top_k"],
             )
@@ -252,6 +357,23 @@ class RAGWorkflow:
         return {"context": "\n\n".join(blocks)}
 
     def generate_answer(self, state: RAGState) -> RAGState:
+        if state.get("conversational"):
+            conversational_reply = getattr(self.llm, "generate_conversational_reply", None)
+            answer = (
+                conversational_reply(
+                    question=state["question"],
+                    history=state.get("history", []),
+                )
+                if callable(conversational_reply)
+                else DEFAULT_GREETING_ANSWER
+            )
+            return {
+                "answer": answer,
+                "cited_chunk_ids": [],
+                "cited_image_ids": [],
+                "unanswerable": False,
+            }
+
         images = state.get("images", [])
         if not state.get("context", "").strip() and not images:
             return {
@@ -295,6 +417,13 @@ class RAGWorkflow:
                 if image_id in images_by_id
             )
         )
+        if state.get("conversational"):
+            return {
+                "citations": [],
+                "cited_chunk_ids": [],
+                "cited_image_ids": [],
+                "unanswerable": False,
+            }
         if state.get("unanswerable") or not valid_chunks and not valid_image_ids:
             return {
                 "answer": UNANSWERABLE_ANSWER,

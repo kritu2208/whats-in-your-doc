@@ -53,6 +53,31 @@ export type ChatResponse = {
   latency_ms: number;
 };
 
+export type ConversationSummary = {
+  id: string;
+  title: string;
+  message_count: number;
+  preview: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type SavedMessageItem = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  citations: Citation[];
+  created_at: string;
+};
+
+export type ConversationDetail = {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  messages: SavedMessageItem[];
+};
+
 export type RetrievalMode = "dense" | "bm25" | "hybrid" | "hybrid_rerank";
 
 type ChatRequest = {
@@ -102,6 +127,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(message);
   }
 
+  if (response.status === 204) {
+    return undefined as T;
+  }
+
   return (await response.json()) as T;
 }
 
@@ -126,6 +155,31 @@ export function uploadDocument(file: File): Promise<DocumentItem> {
   const form = new FormData();
   form.append("file", file);
   return request("/api/documents", { method: "POST", body: form });
+}
+
+export function deleteDocument(documentId: string): Promise<void> {
+  return request(`/api/documents/${encodeURIComponent(documentId)}`, {
+    method: "DELETE",
+  });
+}
+
+export function listConversations(): Promise<ConversationSummary[]> {
+  return request("/api/chat/conversations");
+}
+
+export function getConversation(
+  conversationId: string,
+): Promise<ConversationDetail> {
+  return request(
+    `/api/chat/conversations/${encodeURIComponent(conversationId)}`,
+  );
+}
+
+export function deleteConversation(conversationId: string): Promise<void> {
+  return request(
+    `/api/chat/conversations/${encodeURIComponent(conversationId)}`,
+    { method: "DELETE" },
+  );
 }
 
 export function sendQuestion(payload: ChatRequest): Promise<ChatResponse> {

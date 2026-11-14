@@ -583,3 +583,28 @@ def test_document_api_enforces_chunk_limit(
 
     assert response.status_code == 413
     assert session.documents == []
+
+
+def test_document_api_rejects_duplicate_filename_and_content(api_client: Any) -> None:
+    client, session = api_client
+    content = b"# Unique Policy\n\nAnnual security audit policy."
+    first = client.post(
+        "/api/documents",
+        files={"file": ("policy.md", content, "text/markdown")},
+    )
+    assert first.status_code == 201
+
+    duplicate_name = client.post(
+        "/api/documents",
+        files={"file": ("Policy.md", b"# Different content\n\nOther text.", "text/markdown")},
+    )
+    assert duplicate_name.status_code == 409
+    assert "already exists" in duplicate_name.json()["detail"].lower()
+
+    duplicate_content = client.post(
+        "/api/documents",
+        files={"file": ("policy-copy.md", content, "text/markdown")},
+    )
+    assert duplicate_content.status_code == 409
+    assert "policy.md" in duplicate_content.json()["detail"]
+    assert len(session.documents) == 1

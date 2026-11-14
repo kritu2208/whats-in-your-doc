@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.core.config import get_settings
 from app.models import Conversation, Document, Message
@@ -61,6 +62,14 @@ class ChatRepository:
             for message in reversed(messages)
         ]
 
+    @staticmethod
+    def message_sort_key(message: Message) -> tuple[datetime, int, uuid.UUID]:
+        return (
+            message.created_at,
+            0 if message.role == "user" else 1,
+            message.id,
+        )
+
     def persist_exchange(
         self,
         *,
@@ -69,12 +78,14 @@ class ChatRepository:
         answer: str,
         citations: list[dict[str, Any]],
     ) -> uuid.UUID:
+        now = datetime.now(timezone.utc)
         if conversation_id is None:
             conversation = Conversation(title=question[:255])
             self.session.add(conversation)
             self.session.flush()
         else:
             conversation = self.get_conversation(conversation_id)
+            conversation.updated_at = now
 
         self.session.add_all(
             [
@@ -83,14 +94,67 @@ class ChatRepository:
                     role="user",
                     content=question,
                     citations=None,
+                    created_at=now,
                 ),
                 Message(
                     conversation_id=conversation.id,
                     role="assistant",
                     content=answer,
                     citations=citations,
+                    created_at=now + timedelta(milliseconds=1),
                 ),
             ]
         )
         self.session.commit()
         return conversation.id
+
+    def list_conversations(
+        self, *, offset: int = 0, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        statement = (
+            select(Conversation)
+            .options(selectinload(Conversation.messages))
+            .order_by(Conversation.updated_at.desc(), Conversation.id)
+            .offset(offset)
+            .limit(limit)
+        )
+        conversations = self.session.scalars(statement).all()
+        summaries: list[dict[str, Any]] = []
+        for conversation in conversations:
+            ordered = sorted(
+                conversation.messages,
+                key=self.message_sort_key,
+            )
+            last_message = ordered[-1] if ordered else None
+            preview = (
+                " ".join(last_message.content.split())[:120]
+                if last_message is not None
+                else ""
+            )
+            summaries.append(
+                {
+                    "id": conversation.id,
+                    "title": conversation.title or "Untitled chat",
+                    "message_count": len(ordered),
+                    "preview": preview,
+                    "created_at": conversation.created_at,
+                    "updated_at": conversation.updated_at,
+                }
+            )
+        return summaries
+
+    def get_conversation_detail(self, conversation_id: uuid.UUID) -> Conversation:
+        statement = (
+            select(Conversation)
+            .options(selectinload(Conversation.messages))
+            .where(Conversation.id == conversation_id)
+        )
+        conversation = self.session.scalar(statement)
+        if conversation is None:
+            raise ConversationNotFoundError("Conversation not found.")
+        return conversation
+
+    def delete_conversation(self, conversation_id: uuid.UUID) -> None:
+        conversation = self.get_conversation(conversation_id)
+        self.session.delete(conversation)
+        self.session.commit()

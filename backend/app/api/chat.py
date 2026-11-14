@@ -6,9 +6,10 @@ import time
 import uuid
 from dataclasses import dataclass
 from collections.abc import Generator
+from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import exists, select
@@ -35,7 +36,13 @@ from app.llm.groq_service import (
 )
 from app.llm.provider import get_llm_service
 from app.models import Document, DocumentImage
-from app.rag.workflow import AnswerGenerator, RAGWorkflow
+from app.rag.workflow import (
+    AnswerGenerator,
+    RAGWorkflow,
+    build_retrieval_query,
+    is_conversational_greeting,
+    is_image_request,
+)
 from app.retrieval.engine import (
     RetrievalEngine,
     RetrievalMode,
@@ -97,6 +104,31 @@ class ChatResponse(BaseModel):
     conversation_id: uuid.UUID
     retrieval_metadata: dict[str, Any]
     latency_ms: float
+
+
+class ConversationSummaryResponse(BaseModel):
+    id: uuid.UUID
+    title: str
+    message_count: int
+    preview: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class SavedMessageResponse(BaseModel):
+    id: uuid.UUID
+    role: str
+    content: str
+    citations: list[ChatCitation] = Field(default_factory=list)
+    created_at: datetime
+
+
+class ConversationDetailResponse(BaseModel):
+    id: uuid.UUID
+    title: str
+    created_at: datetime
+    updated_at: datetime
+    messages: list[SavedMessageResponse]
 
 
 def get_chat_repository(session: Session = Depends(get_db)) -> ChatRepository:
@@ -253,6 +285,34 @@ def get_relevant_images(
     ]
 
 
+def _vision_images(retrieved_images: list[RetrievedChatImage]) -> list[VisionImage]:
+    return [
+        VisionImage(
+            image_id=str(image.source.image_id),
+            label=f"{image.source.document_name}, page {image.source.page_number}",
+            media_type=image.source.media_type,
+            data=image.data,
+            context_text=image.source.context_excerpt,
+        )
+        for image in retrieved_images
+    ]
+
+
+def _order_response_images(
+    retrieved_images: list[RetrievedChatImage],
+    cited_image_ids: set[str],
+) -> list[ChatImage]:
+    updated = [
+        image.source.model_copy(
+            update={"cited": str(image.source.image_id) in cited_image_ids}
+        )
+        for image in retrieved_images
+    ]
+    # Surface LLM-cited figures first while preserving retrieval order within each group.
+    updated.sort(key=lambda image: not image.cited)
+    return updated
+
+
 @router.post("/query", response_model=ChatResponse)
 def query_chat(
     payload: ChatRequest,
@@ -283,15 +343,19 @@ def query_chat(
             repository.get_conversation(payload.conversation_id)
             history = repository.get_recent_history(payload.conversation_id)
 
+        should_include_images = (
+            payload.include_images or is_image_request(question)
+        ) and not is_conversational_greeting(question)
+        image_query = build_retrieval_query(question, history)
         retrieved_images = (
             get_relevant_images(
                 session,
-                question=question,
+                question=image_query,
                 document_ids=payload.document_ids,
                 image_embedder=image_embedder,
                 text_embedder=text_embedder,
             )
-            if payload.include_images
+            if should_include_images
             else []
         )
         try:
@@ -303,19 +367,7 @@ def query_chat(
                 top_k=payload.top_k,
                 candidate_k=payload.candidate_k or get_settings().retrieval_candidate_k,
                 history=history,
-                images=[
-                    VisionImage(
-                        image_id=str(image.source.image_id),
-                        label=(
-                            f"{image.source.document_name}, "
-                            f"page {image.source.page_number}"
-                        ),
-                        media_type=image.source.media_type,
-                        data=image.data,
-                        context_text=image.source.context_excerpt,
-                    )
-                    for image in retrieved_images
-                ],
+                images=_vision_images(retrieved_images),
             )
         except LLMRequestError as exc:
             if not retrieved_images:
@@ -341,12 +393,7 @@ def query_chat(
         answer = result["answer"]
         citations = result.get("citations", [])
         cited_image_ids = set(result.get("cited_image_ids", []))
-        images = [
-            image.source.model_copy(
-                update={"cited": str(image.source.image_id) in cited_image_ids}
-            )
-            for image in retrieved_images
-        ]
+        images = _order_response_images(retrieved_images, cited_image_ids)
         conversation_id = repository.persist_exchange(
             conversation_id=payload.conversation_id,
             question=question,
@@ -429,15 +476,19 @@ def stream_chat(
                 repository.get_conversation(payload.conversation_id)
                 history = repository.get_recent_history(payload.conversation_id)
 
+            should_include_images = (
+                payload.include_images or is_image_request(question)
+            ) and not is_conversational_greeting(question)
+            image_query = build_retrieval_query(question, history)
             retrieved_images = (
                 get_relevant_images(
                     session,
-                    question=question,
+                    question=image_query,
                     document_ids=payload.document_ids,
                     image_embedder=image_embedder,
                     text_embedder=text_embedder,
                 )
-                if payload.include_images
+                if should_include_images
                 else []
             )
             yield _sse_event("status", {"stage": "generating"})
@@ -450,19 +501,7 @@ def stream_chat(
                 candidate_k=payload.candidate_k
                 or get_settings().retrieval_candidate_k,
                 history=history,
-                images=[
-                    VisionImage(
-                        image_id=str(image.source.image_id),
-                        label=(
-                            f"{image.source.document_name}, "
-                            f"page {image.source.page_number}"
-                        ),
-                        media_type=image.source.media_type,
-                        data=image.data,
-                        context_text=image.source.context_excerpt,
-                    )
-                    for image in retrieved_images
-                ],
+                images=_vision_images(retrieved_images),
             )
             while True:
                 try:
@@ -476,12 +515,7 @@ def stream_chat(
             answer = result["answer"]
             citations = result.get("citations", [])
             cited_image_ids = set(result.get("cited_image_ids", []))
-            images = [
-                image.source.model_copy(
-                    update={"cited": str(image.source.image_id) in cited_image_ids}
-                )
-                for image in retrieved_images
-            ]
+            images = _order_response_images(retrieved_images, cited_image_ids)
             conversation_id = repository.persist_exchange(
                 conversation_id=payload.conversation_id,
                 question=question,
@@ -535,3 +569,81 @@ def stream_chat(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.get("/conversations", response_model=list[ConversationSummaryResponse])
+def list_conversations(
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    repository: ChatRepository = Depends(get_chat_repository),
+) -> list[ConversationSummaryResponse]:
+    try:
+        summaries = repository.list_conversations(offset=offset, limit=limit)
+    except SQLAlchemyError as exc:
+        logger.warning("Could not list conversations")
+        raise HTTPException(
+            status_code=503,
+            detail="Chat history is unavailable right now.",
+        ) from exc
+    return [ConversationSummaryResponse(**item) for item in summaries]
+
+
+@router.get(
+    "/conversations/{conversation_id}",
+    response_model=ConversationDetailResponse,
+)
+def get_conversation(
+    conversation_id: uuid.UUID,
+    repository: ChatRepository = Depends(get_chat_repository),
+) -> ConversationDetailResponse:
+    try:
+        conversation = repository.get_conversation_detail(conversation_id)
+    except ConversationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        logger.warning("Could not load conversation %s", conversation_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Chat history is unavailable right now.",
+        ) from exc
+
+    ordered_messages = sorted(
+        conversation.messages,
+        key=ChatRepository.message_sort_key,
+    )
+    return ConversationDetailResponse(
+        id=conversation.id,
+        title=conversation.title or "Untitled chat",
+        created_at=conversation.created_at,
+        updated_at=conversation.updated_at,
+        messages=[
+            SavedMessageResponse(
+                id=message.id,
+                role=message.role,
+                content=message.content,
+                citations=message.citations or [],
+                created_at=message.created_at,
+            )
+            for message in ordered_messages
+        ],
+    )
+
+
+@router.delete(
+    "/conversations/{conversation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_conversation(
+    conversation_id: uuid.UUID,
+    repository: ChatRepository = Depends(get_chat_repository),
+) -> None:
+    try:
+        repository.delete_conversation(conversation_id)
+    except ConversationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        logger.warning("Could not delete conversation %s", conversation_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Could not delete the conversation.",
+        ) from exc

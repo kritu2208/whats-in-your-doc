@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
+from dataclasses import replace
 from datetime import datetime
 
 from fastapi import (
@@ -62,6 +64,24 @@ class ChunkPreviewResponse(BaseModel):
     content: str
 
 
+def _find_duplicate_document(
+    session: Session,
+    *,
+    filename: str,
+    file_sha256: str,
+) -> tuple[Document, str] | None:
+    normalized_name = filename.casefold()
+    for existing in session.scalars(select(Document)).all():
+        if existing.status == "failed":
+            continue
+        if existing.filename.casefold() == normalized_name:
+            return existing, "name"
+        metadata = existing.document_metadata or {}
+        if metadata.get("content_sha256") == file_sha256:
+            return existing, "content"
+    return None
+
+
 @router.post("", response_model=DocumentResponse, status_code=status.HTTP_201_CREATED)
 def upload_document(
     file: UploadFile = File(...),
@@ -82,6 +102,21 @@ def upload_document(
     data = file.file.read(max_bytes + 1)
     if len(data) > max_bytes:
         raise HTTPException(status_code=413, detail="The uploaded file exceeds the size limit.")
+
+    file_sha256 = hashlib.sha256(data).hexdigest()
+    duplicate = _find_duplicate_document(
+        session,
+        filename=filename,
+        file_sha256=file_sha256,
+    )
+    if duplicate is not None:
+        existing_doc, reason = duplicate
+        detail = (
+            f"Can't upload '{filename}': it already exists."
+            if reason == "name"
+            else f"Can't upload '{filename}': this file already exists as '{existing_doc.filename}'."
+        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
 
     try:
         (
@@ -112,11 +147,16 @@ def upload_document(
             detail="PDF image search is unavailable. Please try again later.",
         ) from exc
 
+    parsed_with_hash = replace(
+        parsed,
+        metadata={**parsed.metadata, "content_sha256": file_sha256},
+    )
+
     try:
         return save_document(
             session,
             filename=filename,
-            parsed=parsed,
+            parsed=parsed_with_hash,
             chunks=chunks,
             embeddings=embeddings,
             image_embeddings=image_embeddings,
